@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/smtp"
 	"net/url"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"time"

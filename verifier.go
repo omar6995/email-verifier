@@ -2,10 +2,7 @@ package emailverifier
 
 import (
 	"fmt"
-	"log"
 	"net/http"
-	"runtime/debug"
-	"strings"
 	"time"
 )
 
@@ -280,6 +277,7 @@ func (v *Verifier) stopCurrentSchedule() {
 //   - username is used to check the deliverability of specific email address,
 //
 // if server is catch-all server, username will not be checked
+/*
 func (v *Verifier) CheckSMTP(domain, username string) (*SMTP, error) {
 	if v.debugModeEnabled {
 		log.Printf("[DEBUG-VERIFIER] CheckSMTP started for domain=%s, username=%s", domain, username)
@@ -421,3 +419,4 @@ func (v *Verifier) CheckSMTP(domain, username string) (*SMTP, error) {
 	}
 	return &ret, nil
 }
+*/
