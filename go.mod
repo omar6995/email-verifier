@@ -1,4 +1,4 @@
-module github.com/AfterShip/email-verifier
+module github.com/omar6995/email-verifier
 
 go 1.22
 
