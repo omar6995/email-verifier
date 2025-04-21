@@ -2,7 +2,10 @@ package emailverifier
 
 import (
 	"fmt"
+	"log"
 	"net/http"
+	"runtime/debug"
+	"strings"
 	"time"
 )
 
@@ -12,6 +15,7 @@ type Verifier struct {
 	catchAllCheckEnabled bool                       // SMTP catchAll check enabled or disabled (enabled by default)
 	domainSuggestEnabled bool                       // whether suggest a most similar correct domain or not (disabled by default)
 	gravatarCheckEnabled bool                       // gravatar check enabled or disabled (disabled by default)
+	debugModeEnabled     bool                       // Debug logging enabled or disabled (disabled by default)
 	fromEmail            string                     // name to use in the `EHLO:` SMTP command, defaults to "user@example.org"
 	helloName            string                     // email to use in the `MAIL FROM:` SMTP command. defaults to `localhost`
 	schedule             *schedule                  // schedule represents a job schedule
@@ -239,6 +243,18 @@ func (v *Verifier) OperationTimeout(timeout time.Duration) *Verifier {
 	return v
 }
 
+// EnableDebugMode enables verbose logging for debugging purposes.
+func (v *Verifier) EnableDebugMode() *Verifier {
+	v.debugModeEnabled = true
+	return v
+}
+
+// DisableDebugMode disables verbose logging.
+func (v *Verifier) DisableDebugMode() *Verifier {
+	v.debugModeEnabled = false
+	return v
+}
+
 func (v *Verifier) calculateReachable(s *SMTP) string {
 	if !v.smtpCheckEnabled {
 		return reachableUnknown
@@ -257,4 +273,151 @@ func (v *Verifier) stopCurrentSchedule() {
 	if v.schedule != nil {
 		v.schedule.stop()
 	}
+}
+
+// CheckSMTP performs an email verification on the passed domain via SMTP
+//   - the domain is the passed email domain
+//   - username is used to check the deliverability of specific email address,
+//
+// if server is catch-all server, username will not be checked
+func (v *Verifier) CheckSMTP(domain, username string) (*SMTP, error) {
+	if v.debugModeEnabled {
+		log.Printf("[DEBUG-VERIFIER] CheckSMTP started for domain=%s, username=%s", domain, username)
+	}
+	ret := SMTP{
+		CatchAll: true, // Default catchAll to true
+	}
+
+	if !v.smtpCheckEnabled {
+		if v.debugModeEnabled {
+			log.Printf("[DEBUG-VERIFIER] SMTP check disabled.")
+		}
+		return &ret, nil
+	}
+
+	var err error
+	email := fmt.Sprintf("%s@%s", username, domain)
+
+	// Dial any SMTP server that will accept a connection
+	client, mx, err := newSMTPClient(domain, v.proxyURI, v.connectTimeout, v.operationTimeout, v.debugModeEnabled) // Pass debug flag
+	if err != nil {
+		if v.debugModeEnabled {
+			log.Printf("[DEBUG-VERIFIER] newSMTPClient error: %v\n%s", err, debug.Stack())
+		}
+		return &ret, ParseSMTPError(err)
+	}
+	if v.debugModeEnabled {
+		log.Printf("[DEBUG-VERIFIER] Connected to MX: %s", mx.Host)
+	}
+
+	// Defer quit the SMTP connection
+	defer client.Close()
+
+	// Check by api when enabled and host recognized.
+	for _, apiVerifier := range v.apiVerifiers {
+		if apiVerifier.isSupported(strings.ToLower(mx.Host)) {
+			return apiVerifier.check(domain, username)
+		}
+	}
+
+	// Sets the HELO/EHLO hostname
+	if v.debugModeEnabled {
+		log.Printf("[DEBUG-VERIFIER] Sending EHLO/HELO %s", v.helloName)
+	}
+	if err = client.Hello(v.helloName); err != nil {
+		if v.debugModeEnabled {
+			log.Printf("[DEBUG-VERIFIER] EHLO/HELO error: %v\n%s", err, debug.Stack())
+		}
+		return &ret, ParseSMTPError(err)
+	}
+	if v.debugModeEnabled {
+		log.Printf("[DEBUG-VERIFIER] EHLO/HELO successful")
+	}
+
+	// Sets the from email
+	if v.debugModeEnabled {
+		log.Printf("[DEBUG-VERIFIER] Sending MAIL FROM: %s", v.fromEmail)
+	}
+	if err = client.Mail(v.fromEmail); err != nil {
+		if v.debugModeEnabled {
+			log.Printf("[DEBUG-VERIFIER] MAIL FROM error: %v\n%s", err, debug.Stack())
+		}
+		return &ret, ParseSMTPError(err)
+	}
+	if v.debugModeEnabled {
+		log.Printf("[DEBUG-VERIFIER] MAIL FROM successful")
+	}
+
+	// Host exists if we've successfully formed a connection
+	ret.HostExists = true
+
+	// Default sets catch-all to true
+	ret.CatchAll = true
+
+	if v.catchAllCheckEnabled {
+		// Checks the deliver ability of a randomly generated address in
+		// order to verify the existence of a catch-all and etc.
+		randomEmail := GenerateRandomEmail(domain)
+		if v.debugModeEnabled {
+			log.Printf("[DEBUG-VERIFIER] Sending RCPT TO (catch-all check): %s", randomEmail)
+		}
+		if err = client.Rcpt(randomEmail); err != nil {
+			if v.debugModeEnabled {
+				log.Printf("[DEBUG-VERIFIER] RCPT TO (catch-all check) error: %v\n%s", err, debug.Stack())
+			}
+			if e := ParseSMTPError(err); e != nil {
+				switch e.Message {
+				case ErrFullInbox:
+					ret.FullInbox = true
+				case ErrNotAllowed:
+					ret.Disabled = true
+				// If The client typically receives a `550 5.1.1` code as a reply to RCPT TO command,
+				// In most cases, this is because the recipient address does not exist.
+				case ErrServerUnavailable:
+					ret.CatchAll = false
+				default:
+
+				}
+
+			}
+		} else {
+			if v.debugModeEnabled {
+				log.Printf("[DEBUG-VERIFIER] RCPT TO (catch-all check) successful")
+			}
+		}
+
+		// If the email server is a catch-all email server,
+		// no need to calibrate deliverable on a specific user
+		if ret.CatchAll {
+			return &ret, nil
+		}
+	}
+
+	// If no username provided,
+	// no need to calibrate deliverable on a specific user
+	if username == "" {
+		if v.debugModeEnabled {
+			log.Printf("[DEBUG-VERIFIER] No username provided, skipping final RCPT TO")
+		}
+		return &ret, nil
+	}
+
+	if v.debugModeEnabled {
+		log.Printf("[DEBUG-VERIFIER] Sending RCPT TO: %s", email)
+	}
+	if err = client.Rcpt(email); err == nil {
+		if v.debugModeEnabled {
+			log.Printf("[DEBUG-VERIFIER] RCPT TO successful")
+		}
+		ret.Deliverable = true
+	} else {
+		if v.debugModeEnabled {
+			log.Printf("[DEBUG-VERIFIER] RCPT TO error: %v\n%s", err, debug.Stack())
+		}
+	}
+
+	if v.debugModeEnabled {
+		log.Printf("[DEBUG-VERIFIER] CheckSMTP finished for %s", email)
+	}
+	return &ret, nil
 }
